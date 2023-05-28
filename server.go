@@ -11,10 +11,10 @@ import (
 	"sync"
 )
 
-// tinyrpc请求标记
+// MagicNumber tinyrpc请求标记
 const MagicNumber = 0x3bef5c
 
-// 协商编解码方式 固定JSON编码
+// Option 协商编解码方式 固定JSON编码
 // 通过解析Option，服务端可以直到如何读取需要的信息
 type Option struct {
 	MagicNumber int        // MagicNumber标记这是一个tinyrpc的请求
@@ -25,24 +25,24 @@ type Option struct {
 Option{MagicNumber: int, CodecType: Type} | Header{ServiceMethod ...} | Body interface{}|
 */
 
-// 创建默认协商信息实例，方便使用
+// DefaultOption 创建默认协商信息实例，方便使用
 var DefaultOption = &Option{
 	MagicNumber: MagicNumber,   // 0x3bef5c
 	CodecType:   codec.GobType, // Gob方式编解码器
 }
 
-// RPC Server
+// Server RPC Server
 type Server struct {
 }
 
-// 返回一个新的Server
+// NewServer 返回一个新的Server
 func NewServer() *Server {
 	return &Server{}
 }
 
 var DefaultServer *Server = NewServer() // Server的默认实例
 
-// Accept接受网络监听器上的连接并提供请求
+// Accept 接受网络监听器上的连接并提供请求
 func (server *Server) Accept(lis net.Listener) {
 	for { // 循环等待socket连接建立
 		conn, err := lis.Accept()
@@ -55,10 +55,10 @@ func (server *Server) Accept(lis net.Listener) {
 	}
 }
 
-// Accept接受监听器上的连接并提供请求
+// Accept 接受监听器上的连接并提供请求
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
 
-// ServeConn在单个连接上运行服务器
+// ServeConn 在单个连接上运行服务器
 // ServeConn阻塞，为连接提供服务，直到客户端挂断
 func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 
@@ -165,7 +165,7 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 
 	// reflect.Value.Interface()将Value类型的值转换为对应的类型接口
 	// Interface()返回一个空接口类型的值，表示argv的实际值，类型为argv的类型
-	// 读取请求主体保存到req.argv中
+	// 读取body保存到req.argv中
 	if err = cc.ReadBody(req.argv.Interface()); err != nil {
 		log.Println("rpc server: read argv err:", err)
 	}
