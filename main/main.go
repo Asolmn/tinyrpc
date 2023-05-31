@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"github.com/Asolmn/tinyrpc"
 	"log"
 	"net"
@@ -9,25 +8,39 @@ import (
 	"time"
 )
 
+type Foo int
+
+type Args struct {
+	Num1, Num2 int
+}
+
+func (f Foo) Sum(args Args, reply *int) error {
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
 func startServer(addr chan string) {
+	// 注册Foo到Server
+	var foo Foo
+	if err := tinyrpc.Register(&foo); err != nil {
+		log.Fatal("register error: ", err)
+	}
+
 	// 设置一个空闲端口，创建一个网络监听器
 	l, err := net.Listen("tcp", ":5000")
 	if err != nil {
 		log.Fatal("network error: ", err)
 	}
-	// 打印网络地址
-	log.Println("start rpc server on", l.Addr())
-	// 将网络地址传入addr信道
-	addr <- l.Addr().String()
-	// 开始监听
-	tinyrpc.Accept(l)
+
+	log.Println("start rpc server on", l.Addr()) // 打印网络地址
+	addr <- l.Addr().String()                    // 将网络地址传入addr信道
+	tinyrpc.Accept(l)                            // 开始监听
 }
 
 func main() {
-	// 创建一个信道
-	addr := make(chan string)
-	// 启动服务
-	go startServer(addr)
+	log.SetFlags(0)           // 设置日志标志
+	addr := make(chan string) // 创建一个信道
+	go startServer(addr)      // 启动服务
 
 	// 创建客户端连接
 	client, _ := tinyrpc.Dial("tcp", <-addr)
@@ -35,6 +48,7 @@ func main() {
 
 	time.Sleep(time.Second)
 
+	// 发送请求和接受响应
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
 
@@ -42,15 +56,14 @@ func main() {
 
 		go func(i int) {
 			defer wg.Done()
-			args := fmt.Sprintf("tinyrpc req %d", i)
+			args := &Args{Num1: i, Num2: i * i}
 
-			var reply string
-			// 调用Call并发5个RPC同步调用
+			var reply int
 			if err := client.Call("Foo.Sum", args, &reply); err != nil {
 				log.Fatal("call Foo.Sum error:", err)
 			}
 
-			log.Println("reply:", reply)
+			log.Printf("%d + %d = %d:", args.Num1, args.Num2, reply)
 		}(i)
 	}
 	wg.Wait()

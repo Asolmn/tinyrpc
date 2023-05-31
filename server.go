@@ -2,12 +2,13 @@ package tinyrpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"github.com/Asolmn/tinyrpc/codec"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -33,6 +34,7 @@ var DefaultOption = &Option{
 
 // Server RPC Server
 type Server struct {
+	serviceMap sync.Map
 }
 
 // NewServer 返回一个新的Server
@@ -41,22 +43,6 @@ func NewServer() *Server {
 }
 
 var DefaultServer *Server = NewServer() // Server的默认实例
-
-// Accept 接受网络监听器上的连接并提供请求
-func (server *Server) Accept(lis net.Listener) {
-	for { // 循环等待socket连接建立
-		conn, err := lis.Accept()
-		if err != nil {
-			log.Println("rpc server: accept error", err)
-			return
-		}
-		// 开启子协程，处理过程交给ServerConn
-		go server.ServeConn(conn)
-	}
-}
-
-// Accept 接受监听器上的连接并提供请求
-func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
 
 // ServeConn 在单个连接上运行服务器
 // ServeConn阻塞，为连接提供服务，直到客户端挂断
@@ -93,7 +79,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 var invalidRequest = struct{}{}
 
 /*
-serveCodec主要阶段
+serveCodec 主要阶段
 读取请求readRequest
 处理请求handleRequest
 回复请求sendResponse
@@ -125,13 +111,15 @@ func (server *Server) serveCodec(cc codec.Codec) {
 	_ = cc.Close()
 }
 
-// request存储通话的所有信息
+// request 存储通话的所有信息
 type request struct {
-	h            *codec.Header
+	h            *codec.Header // 请求头
 	argv, replyv reflect.Value // reflect.Value可以表示任意类型的值的类型
+	mtype        *methodType   // 方法实例
+	svc          *service      // 服务实例
 }
 
-// 读取请求头
+// readRequestHeader 读取请求头
 func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	var h codec.Header
 	// 读取请求的头部信息，将信息反序列化到h中
@@ -147,7 +135,7 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	return &h, nil
 }
 
-// 读取请求
+// readRequest 读取请求
 func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	// 获取请求头
 	h, err := server.readRequestHeader(cc)
@@ -158,23 +146,35 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	// 构建一个request实例，并初始化其中的h
 	req := &request{h: h}
 
-	// reflect.New()创建一个指向新分配的零值的指针
-	// reflect.TypeOf用于获取一个值的类型信息，返回一个reflect.Type类型的值，表示类型信息
-	// 创建一个新的空字符串的指针，类型是*string
-	req.argv = reflect.New(reflect.TypeOf(""))
+	// 通过请求头中的服务名.方法名，获取service和method实例
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
 
-	// reflect.Value.Interface()将Value类型的值转换为对应的类型接口
-	// Interface()返回一个空接口类型的值，表示argv的实际值，类型为argv的类型
-	// 读取body保存到req.argv中
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
+	// 创建两个入参实例
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	// 确保argvi是一个指针,ReadBody需要一个指针作为参数
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr { // 判断argv是否为指针类型
+		// 如果argv不等于指针类型，则通过Addr返回一个持有指向argv的指针的Value封装
+		// 然后再转为空接口类型
+		argvi = req.argv.Addr().Interface()
+	}
+
+	// 将请求报文反序列化为第一个入参argv
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read body err: ", err)
+		return req, err
 	}
 
 	// 返回请求信息
 	return req, nil
 }
 
-// 回复请求
+// sendResponse 回复请求
 func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
@@ -185,14 +185,85 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
-// 处理请求
+// handleRequest 处理请求
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// ELem()返回argv包含的值或者argv指针指向的值
-	// 打印请求头部和主体信息
-	log.Println(req.h, req.argv.Elem())
-	// 设置请求的回应值
-	req.replyv = reflect.ValueOf(fmt.Sprintf("tinyrpc resp %d", req.h.Seq))
-	// 发送请求
+
+	// 调用方法和传入参数
+	// 等价svc.req.mtype(req.argv, req.replyv)
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		// 设置请求头中的错误信息，并返回发送
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
+	// 传递给sendReponse完成序列化
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
+
+// findService 通过ServiceMethod从serviceMap中找到对应的service
+// 返回对应的service实例与method实例还有错误信息
+func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	// 获得服务名与方法名分割位置的下标
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+
+	// 提取服务名和方法名
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	// 从serviceMap中找到对应的service实例
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+
+	// 类型断言转换为service实例
+	svc = svci.(*service)
+	// 通过方法名获得对应的方法
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+
+	return
+}
+
+// Accept 接受网络监听器上的连接并提供请求
+func (server *Server) Accept(lis net.Listener) {
+	for { // 循环等待socket连接建立
+		conn, err := lis.Accept()
+		if err != nil {
+			log.Println("rpc server: accept error", err)
+			return
+		}
+		// 开启子协程，处理过程交给ServerConn
+		go server.ServeConn(conn)
+	}
+}
+
+// Accept 接受监听器上的连接并提供请求
+func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
+
+// Register method在server中发布
+// 满足以下条件的receiver值
+// 导出类型的导出方法
+// 两个参数，均为导出类型
+// 第二个参数是指针
+// 一个返回值，类型为error
+func (server *Server) Register(rcvr interface{}) error {
+	// 生成service实例
+	s := newService(rcvr)
+
+	// 将service实例添加到服务器中
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// Register 在DefaultServer中发布receiver的方法
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
