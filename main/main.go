@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"github.com/Asolmn/tinyrpc"
 	"log"
 	"net"
@@ -59,7 +60,7 @@ func main() {
 			args := &Args{Num1: i, Num2: i * i}
 
 			var reply int
-			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
 				log.Fatal("call Foo.Sum error:", err)
 			}
 

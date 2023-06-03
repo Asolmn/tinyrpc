@@ -3,13 +3,16 @@ package tinyrpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/Asolmn/tinyrpc/codec"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 // MagicNumber tinyrpc请求标记
@@ -18,8 +21,10 @@ const MagicNumber = 0x3bef5c
 // Option 协商编解码方式 固定JSON编码
 // 通过解析Option，服务端可以直到如何读取需要的信息
 type Option struct {
-	MagicNumber int        // MagicNumber标记这是一个tinyrpc的请求
-	CodecType   codec.Type // 客户端选择不同的编解码器堆正文进行编码
+	MagicNumber    int        // MagicNumber标记这是一个tinyrpc的请求
+	CodecType      codec.Type // 客户端选择不同的编解码器堆正文进行编码
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration
 }
 
 /*
@@ -28,8 +33,9 @@ Option{MagicNumber: int, CodecType: Type} | Header{ServiceMethod ...} | Body int
 
 // DefaultOption 创建默认协商信息实例，方便使用
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,   // 0x3bef5c
-	CodecType:   codec.GobType, // Gob方式编解码器
+	MagicNumber:    MagicNumber,      // 0x3bef5c
+	CodecType:      codec.GobType,    // Gob方式编解码器
+	ConnectTimeout: time.Second * 10, // 连接超时时间
 }
 
 // Server RPC Server
@@ -72,7 +78,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		return
 	}
 	// f(conn)返回一个GobCodec实例,等价于直接调用NewGobCodec(conn)
-	server.serveCodec(f(conn))
+	server.serveCodec(f(conn), &opt)
 }
 
 // 发生错误时响应argv的占位符
@@ -84,7 +90,7 @@ serveCodec 主要阶段
 处理请求handleRequest
 回复请求sendResponse
 */
-func (server *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex) // 确保发送完整的响应
 	wg := new(sync.WaitGroup)  // 等待，直到所有请求都得到处理
 
@@ -103,7 +109,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 		}
 		wg.Add(1)
 		// 处理请求是并发的，但是回复请求必须是逐个发送，所以需要使用锁进行保证
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	// 等待所有请求完成
 	wg.Wait()
@@ -186,20 +192,43 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 }
 
 // handleRequest 处理请求
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+// 整个过程拆分为called和sent两个阶段
+// called 信道接受消息，代表处理没有超时
+// time.After()先于called，则处理已经超时
+// called和sent都将被阻塞
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
 
-	// 调用方法和传入参数
-	// 等价svc.req.mtype(req.argv, req.replyv)
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		// 设置请求头中的错误信息，并返回发送
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+
+	go func() {
+		// 调用req.svc.method(req.argv, req.replyv)
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{} // 通知信道，方法已经调用
+		if err != nil {      // 如果发生错误，设置错误信息，并发送回client
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{} // 通知发送信道
+			return
+		}
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending) // 执行正确调用，发送给client
+		sent <- struct{}{}                                              // 通知发送信道，sendResponse已执行
+	}()
+
+	if timeout == 0 { // 如果超时设置为0，直接通过called和sent信道，结束生命周期
+		<-called
+		<-sent
 		return
 	}
-	// 传递给sendReponse完成序列化
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+
+	select {
+	case <-time.After(timeout): // 处理超时，发送错误信息给client
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called: // 成功执行
+		<-sent // 通知发送信道
+	}
 }
 
 // findService 通过ServiceMethod从serviceMap中找到对应的service
@@ -267,3 +296,35 @@ func (server *Server) Register(rcvr interface{}) error {
 
 // Register 在DefaultServer中发布receiver的方法
 func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+
+const (
+	connected        = "200 Connected to tinyrpc"
+	defaultRPCPath   = "/_tinyrpc_"
+	defaultDebugPath = "/debug/tinyrpc"
+)
+
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ":", err.Error())
+		return
+	}
+
+	_, _ = io.WriteString(conn, "HTTP/1.0"+connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}

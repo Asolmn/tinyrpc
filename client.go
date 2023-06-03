@@ -1,6 +1,7 @@
 package tinyrpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Call 为call操作的实例
@@ -151,6 +153,89 @@ func (client *Client) receive() {
 	client.terminateCalls(err)
 }
 
+// send 发送请求
+func (client *Client) send(call *Call) {
+	client.sending.Lock()
+	defer client.sending.Unlock()
+
+	// 注册call
+	seq, err := client.registerCall(call)
+	if err != nil {
+		call.Error = err
+		call.done()
+		return
+	}
+
+	// 准备请求头
+	client.header.ServiceMethod = call.ServiceMethod
+	client.header.Seq = seq
+	client.header.Error = ""
+
+	// Write设置header与body并发送
+	if err := client.cc.Write(&client.header, call.Args); err != nil {
+		// 如果发送失败，都要将call移除pending队列
+		call := client.removeCall(seq)
+		// call可能为nil，通常意味着Write部分失败，客户端已收到响应并进行处理
+		if call != nil {
+			call.Error = err
+			call.done()
+		}
+	}
+}
+
+// parseOptions 实现Option为可选参数
+func parseOptions(opts ...*Option) (*Option, error) {
+	// 如果没有Option信息
+	if len(opts) == 0 || opts[0] == nil {
+		return DefaultOption, nil
+	}
+	// 判断是否只接收到一个Option信息
+	if len(opts) != 1 {
+		return nil, errors.New("number of options is more than 1")
+	}
+
+	// 获取Option，并设置tinyrpc请求
+	opt := opts[0]
+	opt.MagicNumber = DefaultOption.MagicNumber
+	if opt.CodecType == "" {
+		opt.CodecType = DefaultOption.CodecType
+	}
+	return opt, nil
+}
+
+// Go 异步调用函数。
+// 它返回表示调用的Call结构。
+func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
+	if done == nil { // 检查done通道为空
+		done = make(chan *Call, 10)
+	} else if cap(done) == 0 { // 检查done通道的缓存区间是否为0
+		log.Panic("rpc client: done channel is unbuffered")
+	}
+
+	call := &Call{
+		ServiceMethod: serviceMethod,
+		Args:          args,
+		Reply:         reply,
+		Done:          done,
+	}
+	// 发送call
+	client.send(call)
+	return call
+}
+
+// Call 调用命名函数，等待它完成，
+// 并返回其错误状态
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
+}
+
 // NewClient 创建Client实例，同时进行一开始的协议交换
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	// 生成NewGobCodec实例
@@ -187,101 +272,53 @@ func newClientCodec(cc codec.Codec, option *Option) *Client {
 	return client
 }
 
-// parseOptions 实现Option为可选参数
-func parseOptions(opts ...*Option) (*Option, error) {
-	// 如果没有Option信息
-	if len(opts) == 0 || opts[0] == nil {
-		return DefaultOption, nil
+// clientResult 存储NewClient执行结果
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+func dialTimeout(newClient newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+
+	opt, err := parseOptions(opts...) // 解析Option
+	if err != nil {
+		return
 	}
-	// 判断是否只接收到一个Option信息
-	if len(opts) != 1 {
-		return nil, errors.New("number of options is more than 1")
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout) // 建立连接
+	if err != nil {
+		return
+	}
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	ch := make(chan clientResult)
+
+	// 通过子协程创建执行NewClient，执行完成后，通过信道ch发送结果
+	go func() {
+		client, err := newClient(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+
+	// 如果连接超时时间设置为0，则直接返回NewClient的执行结果
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
 	}
 
-	// 获取Option，并设置tinyrpc请求
-	opt := opts[0]
-	opt.MagicNumber = DefaultOption.MagicNumber
-	if opt.CodecType == "" {
-		opt.CodecType = DefaultOption.CodecType
+	select {
+	case <-time.After(opt.ConnectTimeout): // time.After信道先收到消息，说明NewClient执行超时
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch: // 从ch信道获取NewClient执行的结果
+		return result.client, result.err
 	}
-	return opt, nil
 }
 
 // Dial 连接到指定网络地址的RPC服务器
 func Dial(network, address string, opts ...*Option) (client *Client, err error) {
-	// 返回解析好的Option信息
-	opt, err := parseOptions(opts...)
-	if err != nil {
-		return nil, err
-	}
-	// 建立网络连接
-	conn, err := net.Dial(network, address)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if client == nil {
-			_ = conn.Close()
-		}
-	}()
-	// 返回Client
-	return NewClient(conn, opt)
-}
-
-// send 发送请求
-func (client *Client) send(call *Call) {
-	client.sending.Lock()
-	defer client.sending.Unlock()
-
-	// 注册call
-	seq, err := client.registerCall(call)
-	if err != nil {
-		call.Error = err
-		call.done()
-		return
-	}
-
-	// 准备请求头
-	client.header.ServiceMethod = call.ServiceMethod
-	client.header.Seq = seq
-	client.header.Error = ""
-
-	// Write设置header与body并发送
-	if err := client.cc.Write(&client.header, call.Args); err != nil {
-		// 如果发送失败，都要将call移除pending队列
-		call := client.removeCall(seq)
-		// call可能为nil，通常意味着Write部分失败，客户端已收到响应并进行处理
-		if call != nil {
-			call.Error = err
-			call.done()
-		}
-	}
-}
-
-// Go 异步调用函数。
-// 它返回表示调用的Call结构。
-func (client *Client) Go(serviceMethod string, args, reply interface{}, done chan *Call) *Call {
-	if done == nil { // 检查done通道为空
-		done = make(chan *Call, 10)
-	} else if cap(done) == 0 { // 检查done通道的缓存区间是否为0
-		log.Panic("rpc client: done channel is unbuffered")
-	}
-
-	call := &Call{
-		ServiceMethod: serviceMethod,
-		Args:          args,
-		Reply:         reply,
-		Done:          done,
-	}
-	// 发送call
-	client.send(call)
-	return call
-}
-
-// Call 调用命名函数，等待它完成，
-// 并返回其错误状态
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	callDone := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
-	call := <-(callDone.Done)
-	return call.Error
+	return dialTimeout(NewClient, network, address, opts...)
 }
