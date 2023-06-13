@@ -5,6 +5,7 @@ import (
 	"github.com/Asolmn/tinyrpc"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -32,40 +33,41 @@ func startServer(addr chan string) {
 	if err != nil {
 		log.Fatal("network error: ", err)
 	}
-
 	log.Println("start rpc server on", l.Addr()) // 打印网络地址
-	addr <- l.Addr().String()                    // 将网络地址传入addr信道
-	tinyrpc.Accept(l)                            // 开始监听
+
+	tinyrpc.HandleHTTP()
+	addr <- l.Addr().String() // 将网络地址传入addr信道
+	_ = http.Serve(l, nil)    // 监听l上的HTTP请求
+}
+
+func call(addrCh chan string) {
+	connectAddr := "http@" + <-addrCh
+
+	client, _ := tinyrpc.XDial(connectAddr)
+	defer func() { _ = client.Close() }()
+
+	time.Sleep(time.Second)
+	// send request & receive response
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := &Args{Num1: i, Num2: i * i}
+			var reply int
+			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
+				log.Fatal("call Foo.Sum error:", err)
+			}
+			log.Printf("%d + %d = %d", args.Num1, args.Num2, reply)
+		}(i)
+	}
+	wg.Wait()
 }
 
 func main() {
 	log.SetFlags(0)           // 设置日志标志
 	addr := make(chan string) // 创建一个信道
-	go startServer(addr)      // 启动服务
+	go call(addr)
+	startServer(addr) // 启动服务
 
-	// 创建客户端连接
-	client, _ := tinyrpc.Dial("tcp", <-addr)
-	defer func() { _ = client.Close() }()
-
-	time.Sleep(time.Second)
-
-	// 发送请求和接受响应
-	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
-
-		wg.Add(1)
-
-		go func(i int) {
-			defer wg.Done()
-			args := &Args{Num1: i, Num2: i * i}
-
-			var reply int
-			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
-				log.Fatal("call Foo.Sum error:", err)
-			}
-
-			log.Printf("%d + %d = %d:", args.Num1, args.Num2, reply)
-		}(i)
-	}
-	wg.Wait()
 }

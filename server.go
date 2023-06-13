@@ -303,28 +303,43 @@ const (
 	defaultDebugPath = "/debug/tinyrpc"
 )
 
+// ServeHTTP 实现了一个回答RPC请求的http.Handler
+// w用于将响应写回到客户端
+// req包含有关传入请求的所有信息
 func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if req.Method != "CONNECT" {
+	if req.Method != "CONNECT" { // 检查使用的HTTP方法是否为CONNECT
+		// 如果非CONNECT方法，则向客户端发送405信息
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		_, _ = io.WriteString(w, "405 must CONNECT\n")
 		return
 	}
 
+	// 如果方法为CONNECT
+	// 使用类型断言将w转换为http.Hijacker接口
+	// 调用Hijacker接口的Hijack()方法劫持底层连接，连接不再由HTTP管理
+	// 也就是将HTTP对应的TCP连接取出，最后划给Hijacker管理
 	conn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		log.Print("rpc hijacking ", req.RemoteAddr, ":", err.Error())
 		return
 	}
 
-	_, _ = io.WriteString(conn, "HTTP/1.0"+connected+"\n\n")
+	// 如果劫持成功，向客户端写入响应，指示已建立连接
+	// 然后将连接交给ServerConn方法，进行处理rpc通信
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
 	server.ServeConn(conn)
 }
 
+// HandleHTTP 为rpcPath上的RPC消息注册一个HTTP处理程序
 func (server *Server) HandleHTTP() {
+	// Handle注册HTTP处理器handler和对应的模式pattern
 	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	//log.Println("rpc server debug path: ", defaultDebugPath)
 }
 
+// HandleHTTP 默认服务器注册HTTP处理程序的一种方便方法
 func HandleHTTP() {
 	DefaultServer.HandleHTTP()
 }

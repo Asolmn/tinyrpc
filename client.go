@@ -1,6 +1,7 @@
 package tinyrpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -298,7 +301,7 @@ func dialTimeout(newClient newClientFunc, network, address string, opts ...*Opti
 
 	ch := make(chan clientResult)
 
-	// 通过子协程创建执行NewClient，执行完成后，通过信道ch发送结果
+	// 通过子协程创建执行NewClient或NewHTTPClient，执行完成后，通过信道ch发送结果
 	go func() {
 		client, err := newClient(conn, opt)
 		ch <- clientResult{client: client, err: err}
@@ -321,4 +324,46 @@ func dialTimeout(newClient newClientFunc, network, address string, opts ...*Opti
 // Dial 连接到指定网络地址的RPC服务器
 func Dial(network, address string, opts ...*Option) (client *Client, err error) {
 	return dialTimeout(NewClient, network, address, opts...)
+}
+
+// NewHTTPClient 通过HTTP作为传输协议新建客户端
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	// 发起CONNECT请求
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	// 获得响应，检查状态码
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		// 通过HTTP CONNECT请求建立连接后，后续通信过程交给NewClient
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+// DialHTTP 连接到指定的网络地址的HTTP RPC服务器
+// 监听默认的HTTP RPC路径
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial 调用不同的函数连接到RPC服务器
+// 根据第一个参数rpcAddr
+// rpcAddr是一种通用格式（protocol@addr）表示rpc服务器
+// 例如:http@localhost:5000, tcp@localhost:5000
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	// 以@作为分割
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rcp client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		return Dial(protocol, addr, opts...)
+	}
 }

@@ -3,6 +3,7 @@ package tinyrpc
 import (
 	"context"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -69,4 +70,24 @@ func TestClient_Call(t *testing.T) {
 		err := client.Call(context.Background(), "Bar.Timeout", 1, &reply)
 		_assert(err != nil && strings.Contains(err.Error(), "handle timeout"), "expect a timeout error")
 	})
+}
+
+func TestXDial(t *testing.T) {
+	if true {
+		ch := make(chan struct{})
+		addr := "localhost:5000"
+		go func() {
+			_ = os.Remove(addr)
+			l, err := net.Listen("tcp", addr)
+			if err != nil {
+				t.Error("failed to listen tcp socket")
+				return
+			}
+			ch <- struct{}{}
+			Accept(l)
+		}()
+		<-ch
+		_, err := XDial("tcp@" + addr)
+		_assert(err == nil, "failed to connect tcp socket")
+	}
 }
