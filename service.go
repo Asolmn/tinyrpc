@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 )
 
+// methodType 包含一个方法的完整信息
 type methodType struct {
 	method    reflect.Method // 方法本身
 	ArgType   reflect.Type   // 第一个参数的类型
@@ -67,6 +68,7 @@ func (m *methodType) newReplyv() reflect.Value {
 	return replyv
 }
 
+// service 包含一个service的全部信息
 type service struct {
 	name   string                 // 映射的结构体的名称
 	typ    reflect.Type           // 结构体的类型

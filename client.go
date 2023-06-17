@@ -70,7 +70,7 @@ func (client *Client) Close() error {
 	return client.cc.Close()
 }
 
-// IsAvailable 如果客户端确实工作，则IsAvailable返回true
+// IsAvailable 如果客户端活动，则IsAvailable返回true
 func (client *Client) IsAvailable() bool {
 	client.mu.Lock()
 	defer client.mu.Unlock()

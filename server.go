@@ -38,7 +38,7 @@ var DefaultOption = &Option{
 	ConnectTimeout: time.Second * 10, // 连接超时时间
 }
 
-// Server RPC Server
+// Server rpc服务器实例，包含一个service哈希表
 type Server struct {
 	serviceMap sync.Map
 }
