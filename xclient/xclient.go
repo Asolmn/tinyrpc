@@ -21,6 +21,7 @@ type XClient struct {
 // 检验XClient是否提供Close方法
 var _ io.Closer = (*XClient)(nil)
 
+// Close 关闭客户端
 func (xc *XClient) Close() error {
 	xc.mu.Lock()
 	defer xc.mu.Unlock()

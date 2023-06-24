@@ -234,7 +234,7 @@ func (client *Client) Call(ctx context.Context, serviceMethod string, args, repl
 	case <-ctx.Done():
 		client.removeCall(call.Seq)
 		return errors.New("rpc client: call failed: " + ctx.Err().Error())
-	case call := <-call.Done:
+	case call := <-(call.Done):
 		return call.Error
 	}
 }
